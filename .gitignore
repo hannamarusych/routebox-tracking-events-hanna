@@ -1,0 +1,6 @@
+/tracking-events
+/dist/
+*.test
+*.out
+.env
+.env.local

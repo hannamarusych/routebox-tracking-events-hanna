@@ -1,0 +1,71 @@
+# Local-dev compose for routebox-tracking-events.
+#
+# This file is OUT OF DATE. We test against dev AWS and the prod-like
+# RDS in dev account instead. Two specific known things:
+#
+#   1. The postgres image tag below is pinned to a deprecated alpine
+#      variant that Docker Hub no longer serves
+#      (postgres:14.0-alpine3.16). Updating to postgres:14 should
+#      work but we haven't ratified that change.
+#
+#   2. The LocalStack service is commented out. Without it, the AWS
+#      session built in cmd/server/main.go has no creds endpoint to
+#      talk to and the boot flow assumes a real AWS account. There
+#      USED to be a localstack section here; it stopped working when
+#      we pinned aws-sdk-go and the credential provider's behavior
+#      with the LocalStack endpoint url drifted apart.
+#
+# Updating this is a TODO. It's been a TODO for a long time.
+
+version: '3.8'
+
+services:
+
+  postgres:
+    image: postgres:14.0-alpine3.16   # deprecated alpine variant — manifest no longer served
+    environment:
+      POSTGRES_USER: routebox
+      POSTGRES_PASSWORD: routebox
+      POSTGRES_DB: routebox
+    ports:
+      - "5435:5432"
+
+  migrate:
+    image: flyway/flyway:9-alpine
+    depends_on:
+      - postgres
+    volumes:
+      - ${ROUTEBOX_MIGRATIONS_DIR:-../routebox-db-migrations/flyway/sql}:/flyway/sql
+    command: >
+      -url=jdbc:postgresql://postgres:5432/routebox
+      -user=routebox
+      -password=routebox
+      -connectRetries=10
+      migrate
+
+  # localstack:
+  #   image: localstack/localstack:2.3
+  #   environment:
+  #     SERVICES: secretsmanager
+  #   ports:
+  #     - "4566:4566"
+  # ^^ Commented out. The aws-sdk-go credential provider doesn't talk to
+  # LocalStack the way it used to. Bringing this back means picking a
+  # working SDK / LocalStack pair and validating the boot path. Hasn't
+  # been worth a sprint.
+
+  tracking-events:
+    build: .
+    depends_on:
+      - migrate
+    environment:
+      ENV: development
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://routebox:routebox@postgres:5432/routebox
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      CARRIER_SIGNATURE_SECRETS: '{"ups":"dev-ups","fedex":"dev-fdx","dhl":"dev-dhl","usps":"dev-usps"}'
+      PORT: '8080'
+    ports:
+      - "8082:8080"

@@ -1,23 +1,89 @@
-# routebox-tracking-events
+# RouteBox Tracking Events
 
-Go service. Ingests carrier webhook events (UPS, FedEx, DHL, USPS, plus a long tail of regional carriers), validates signatures, dedupes, and writes raw events to the `carrier_events_raw` table for downstream processing.
+## Overview
 
-Stateless except for the database. High write throughput. The least exciting service we own when it's working.
+RouteBox Tracking Events is the ingestion service for carrier webhook data across the RouteBox platform. It receives shipment status updates directly from carriers (UPS, FedEx, DHL, USPS, and a long tail of regional carriers), validates and deduplicates each event, and persists the raw event stream so downstream services can update shipment state. It exists to give the platform a single, reliable entry point for carrier data instead of every service integrating with every carrier independently.
 
-> Read [`routebox-platform-docs`](https://github.com/312school/routebox-platform-docs) first if you haven't.
+---
 
-## What this service does
+## RouteBox Platform
 
-1. HTTP receiver for carrier webhook payloads (`/v1/webhooks/<carrier>`)
-2. Validates the carrier-specific signature (HMAC variations per carrier)
-3. Parses the payload into a normalized event format
-4. Dedupes against the last 24h of events for the same carrier+tracking_number
-5. Writes to `carrier_events_raw` in Postgres
-6. Returns 200 to the carrier
+This repository is one component of the RouteBox platform.
 
-Downstream services (`shipments-api`, `ops-console`) read `carrier_events_raw` to update shipment statuses.
+Related repositories:
+- [routebox-infra-tf-hanna](https://github.com/hannamarusych/routebox-infra-tf-hanna)
+- [routebox-shipments-api-hanna](https://github.com/hannamarusych/routebox-shipments-api-hanna)
+- routebox-tracking-events-hanna (this repository)
+- routebox-route-optimizer-hanna
+- routebox-ops-console-hanna
 
-## Repo layout
+---
+
+## Key Highlights
+
+- Real-world infrastructure patterns
+- Event ingestion at high write throughput
+- Carrier webhook signature validation (HMAC, per-carrier)
+- Deduplication against a rolling time window
+- AWS (ECS, Secrets Manager)
+- Platform engineering practices
+
+---
+
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design, and the [diagrams](./diagrams) folder for visuals as they are added.
+
+---
+
+## Technology Stack
+
+- Go 1.21
+- chi (HTTP router)
+- pgx (PostgreSQL driver)
+- AWS SDK for Go
+- PostgreSQL
+- Docker, Jenkins (CI/CD)
+- Deployed on AWS ECS
+
+---
+
+## Role in the Platform
+
+This service is the boundary between the outside world (carrier webhook calls) and the RouteBox platform. It is intentionally narrow in scope: validate, dedupe, and record. It does not interpret shipment business logic, calculate routes, or expose data to end users directly. That separation keeps the ingestion path simple and fast, which matters because carriers expect a quick response and will retry aggressively if they do not get one.
+
+## How It Interacts With the Infrastructure
+
+The service runs as a container on the ECS infrastructure defined in `routebox-infra-tf-hanna`. It reads carrier signing secrets and AWS credentials from Secrets Manager, and writes to a shared PostgreSQL instance. Deploys go through the shared Jenkins pipeline, which wires the service-specific secrets into the ECS task at deploy time.
+
+## Communication With Other RouteBox Services
+
+This service does not call other RouteBox services directly, and no other service calls it except carriers over the public webhook endpoints. Instead, it communicates asynchronously through the database: it writes to the `carrier_events_raw` table, and downstream services (`routebox-shipments-api-hanna` and `routebox-ops-console-hanna`) read from that table to update shipment status and surface tracking information. This keeps ingestion decoupled from the services that depend on it, so a slowdown downstream never causes carrier webhooks to fail.
+
+## Deployment
+
+Deployed via the standard Jenkins pipeline described in the Jenkinsfile, which calls into the shared `routebox-jenkins` library's `deployToEcs` function. This service has one deployment special case worth knowing about: it authenticates to AWS using long-lived access keys rather than the ECS task role, for reasons explained in [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md). See [docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md) for the full flow.
+
+## Monitoring
+
+The service is stateless aside from its database writes, so health is primarily tracked through write throughput, error rates on webhook validation, and dedupe collisions. Known gaps and the reasoning behind current tradeoffs are documented in [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md).
+
+## Where This Fits in the Overall Architecture
+
+RouteBox Tracking Events sits at the edge of the platform, in front of the database that `routebox-shipments-api-hanna` and `routebox-ops-console-hanna` both read from. It is the first hop for any external carrier data entering the system, and the platform's tracking accuracy depends on it staying fast and reliable.
+
+---
+
+## What This Service Does
+
+- Receives carrier webhook payloads at `/v1/webhooks/<carrier>`
+- Validates the carrier-specific signature (HMAC, varies per carrier)
+- Parses each payload into a normalized event format
+- Deduplicates against the last 24 hours of events for the same carrier and tracking number
+- Writes accepted events to the `carrier_events_raw` table in PostgreSQL
+- Returns a 200 response to the carrier
+
+## Repository Layout
 
 ```
 .
@@ -34,58 +100,35 @@ Downstream services (`shipments-api`, `ops-console`) read `carrier_events_raw` t
 │   ├── db/
 │   └── server/
 ├── Dockerfile
-├── docker-compose.yml         # OUT OF DATE — see notes
+├── docker-compose.yml
 ├── Jenkinsfile
 ├── go.mod
-├── go.sum
-└── README.md
+└── go.sum
 ```
 
-## The AWS access key thing
+## Configuration
 
-This service does not use the ECS task IAM role to authenticate with AWS. It uses long-lived IAM access keys, injected as environment variables from Secrets Manager.
+Key environment variables:
 
-Yes, this is bad. We know.
+- `DATABASE_URL` — PostgreSQL connection string
+- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — long-lived credentials, see [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md)
+- `CARRIER_SIGNATURE_SECRETS` — JSON map of carrier to signing secret, sourced from Secrets Manager
+- `DEDUP_WINDOW_HOURS` — default 24
+- `MAX_PAYLOAD_BYTES` — default 256KB; larger payloads are rejected with a 413
 
-The history is in [`routebox-platform-docs/notes/handover.md`](https://github.com/312school/routebox-platform-docs/blob/main/notes/handover.md). Short version: when this service was migrated to ECS, we couldn't get carrier webhook signature verification to work reliably with the task role due to the way our Go AWS SDK version refreshes credentials. The auth header would intermittently arrive in a state that made HMAC verification fail. About 1 in 50 webhooks. Carriers retry, but we'd lose the dedup window and double-count, which broke billing reconciliation.
-
-The "fix" was the long-lived keys. The keys live in Secrets Manager (`routebox/tracking-events/aws-credentials`) and are rotated quarterly via a Jenkins job (`tracking-events-rotate-keys`). The rotation includes a re-deploy to pick up the new values.
-
-**Don't disable the rotation job.** **Don't refactor away the env-var auth path** without spending a week understanding why it exists. The special-case logic in [`routebox-jenkins`](https://github.com/312school/routebox-jenkins)'s `deployToEcs` is what wires the secret into the container.
-
-If you fix this properly — the SDK has changed since we set this up, and the underlying issue may be solvable now — write up what you found. There is a TODO with this service's name on it in the handover.
-
-## Running locally
+## Running Locally
 
 ```
 docker compose up
 ```
 
-The compose file is **out of date** — it references a Postgres image that no longer pulls cleanly and skips the LocalStack setup the AWS auth path requires. Local dev for this service is currently broken. We test against dev AWS instead. Updating the compose file is a TODO that has been a TODO for a long time.
+Local dev currently has known gaps around the Postgres image and AWS auth path — see [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md) for details and current workarounds.
 
-## Deploys
+## Known Issues
 
-Standard Jenkins flow, but with the special-case secret wiring noted above. The `Jenkinsfile` here imports the shared library and calls `deployToEcs(service: 'tracking-events', env: ...)`, which knows about the access-key injection.
+- Authentication uses long-lived AWS keys instead of the ECS task role (documented tradeoff, see Troubleshooting)
+- `docker-compose.yml` is out of date for local development
+- The DHL carrier handler has not been migrated to DHL's v2 webhook format
+- Deduplication is best-effort; rare races can allow the same event to land twice, which downstream consumers tolerate
 
-## Database
-
-Writes to `carrier_events_raw`. Reads nothing — this service is genuinely write-only against the DB. The table is heavily indexed for the dedupe lookups; see [`routebox-db-migrations`](https://github.com/312school/routebox-db-migrations) for the schema and migration history.
-
-## Configuration
-
-Environment variables. Interesting ones:
-
-- `DATABASE_URL` — Postgres connection
-- `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — long-lived, see above
-- `CARRIER_SIGNATURE_SECRETS` — JSON map of carrier → signing secret, pulled from Secrets Manager
-- `DEDUP_WINDOW_HOURS` — default 24
-- `MAX_PAYLOAD_BYTES` — default 256KB; carriers occasionally send bigger, those get rejected with a 413
-
-## Known issues
-
-- The long-lived keys (above)
-- `docker-compose.yml` rotted (above)
-- The DHL carrier handler has a TODO from years ago about handling their v2 webhook format. They never enforced the migration. We're still on v1.
-- Dedup is best-effort — Postgres unique constraint on `(carrier, tracking_number, event_type, event_time)` plus `ON CONFLICT DO NOTHING`. In rare races, the same event lands twice. Downstream tolerates it.
-
-For more, read [`routebox-platform-docs/notes/handover.md`](https://github.com/312school/routebox-platform-docs/blob/main/notes/handover.md).
+For more background, see [docs/TROUBLESHOOTING.md](./docs/TROUBLESHOOTING.md).
